@@ -1,0 +1,221 @@
+package config
+
+import (
+	"context"
+	"strconv"
+	"time"
+
+	"github.com/rs/zerolog"
+	"github.com/spf13/viper"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readconcern"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
+	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	{{if .IsOtelEnabled}}"go.opentelemetry.io/contrib/instrumentation/go.mongodb.org/mongo-driver/mongo/otelmongo"{{end}}
+)
+
+const (
+	DefaultMongoMinPoolSize     = 1
+	DefaultMongoMaxPoolSize     = 100
+	DefaultMongoMaxConnIdleTime = 15 * time.Minute
+
+	ReadConcernAvailable    = "available"
+	ReadConcernLinearizable = "linearizable"
+	ReadConcernLocal        = "local"
+	ReadConcernMajority     = "majority"
+	ReadConcernSnapshot     = "snapshot"
+
+	WriteConcernMajority = "majority"
+)
+
+type MongoConfig struct {
+	Name            string `validate:"required"`
+	Uri             string `validate:"required"`
+	DatabaseName    string `validate:"required"`
+	MinPoolSize     uint64
+	MaxPoolSize     uint64
+	MaxConnIdleTime time.Duration
+	ReadConcern     string
+	WriteConcern    string
+	JournalAck      string
+}
+
+func NewMongoConfig(name string, key string) MongoConfig {
+	return MongoConfig{
+		Name:            name,
+		Uri:             viper.GetString("MONGO_" + key + "_URI"),
+		DatabaseName:    viper.GetString("MONGO_" + key + "_DATABASE_NAME"),
+		MinPoolSize:     viper.GetUint64("MONGO_" + key + "_MIN_POOL_SIZE"),
+		MaxPoolSize:     viper.GetUint64("MONGO_" + key + "_MAX_POOL_SIZE"),
+		MaxConnIdleTime: viper.GetDuration("MONGO_"+key+"_MAX_CONN_IDLE_TIME_MIN") * time.Minute,
+		ReadConcern:     viper.GetString("MONGO_" + key + "_READ_CONCERN"),
+		WriteConcern:    viper.GetString("MONGO_" + key + "_WRITE_CONCERN"),
+		JournalAck:      viper.GetString("MONGO_" + key + "_JOURNAL_ACK"),
+	}
+}
+
+type Mongo struct {
+	Client       *mongo.Client
+	Name         string
+	DatabaseName string
+	syslog       zerolog.Logger
+}
+
+func NewMongo(ctx context.Context, syslog zerolog.Logger, timeout time.Duration, cfg MongoConfig) (*Mongo, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	zlog := syslog.With().Str("name", cfg.Name).Logger()
+	zlog.Info().Msg("connecting to mongo...")
+
+	setDefaultValues(&cfg)
+
+	m := &Mongo{
+		Name:         cfg.Name,
+		DatabaseName: cfg.DatabaseName,
+		syslog:       zlog,
+	}
+
+	optionsClient := buildClientOptions(zlog, cfg)
+	client, err := connectToMongo(ctx, optionsClient)
+	if err != nil {
+		zlog.Fatal().Err(err).Msg("failed to connect to mongo")
+	}
+
+	m.Client = client
+	zlog.Info().Msg("connected to mongo")
+	return m, nil
+}
+
+func setDefaultValues(cfg *MongoConfig) {
+	if cfg.MinPoolSize == 0 {
+		cfg.MinPoolSize = DefaultMongoMinPoolSize
+	}
+
+	if cfg.MaxPoolSize == 0 {
+		cfg.MaxPoolSize = DefaultMongoMaxPoolSize
+	}
+
+	if cfg.MaxConnIdleTime == 0 {
+		cfg.MaxConnIdleTime = DefaultMongoMaxConnIdleTime
+	}
+}
+
+func buildClientOptions(syslog zerolog.Logger, cfg MongoConfig) *options.ClientOptions {
+	optionsClient := options.
+		Client().
+		ApplyURI(cfg.Uri).
+		SetMinPoolSize(cfg.MinPoolSize).
+		SetMaxPoolSize(cfg.MaxPoolSize).
+		SetMaxConnIdleTime(cfg.MaxConnIdleTime).
+		{{if .IsOtelEnabled}}SetMonitor(otelmongo.NewMonitor()){{end}}
+
+	optionsClient = configureReadConcern(optionsClient, cfg.ReadConcern)
+	optionsClient = configureWriteConcern(syslog, optionsClient, cfg)
+
+	return optionsClient
+}
+
+func configureReadConcern(optionsClient *options.ClientOptions, readConcernStr string) *options.ClientOptions {
+	if readConcernStr == "" {
+		return optionsClient
+	}
+
+	var rc *readconcern.ReadConcern
+	switch readConcernStr {
+	case ReadConcernAvailable:
+		rc = readconcern.Available()
+	case ReadConcernLinearizable:
+		rc = readconcern.Linearizable()
+	case ReadConcernLocal:
+		rc = readconcern.Local()
+	case ReadConcernMajority:
+		rc = readconcern.Majority()
+	case ReadConcernSnapshot:
+		rc = readconcern.Snapshot()
+	default:
+		rc = readconcern.Local()
+	}
+
+	return optionsClient.SetReadConcern(rc)
+}
+
+func configureWriteConcern(syslog zerolog.Logger, optionsClient *options.ClientOptions, cfg MongoConfig) *options.ClientOptions {
+	if cfg.WriteConcern == "" {
+		return optionsClient
+	}
+
+	var w *writeconcern.WriteConcern
+	journalAck := parseJournalAck(syslog, cfg.JournalAck, cfg.Name)
+
+	if cfg.WriteConcern == WriteConcernMajority {
+		w = buildMajorityWriteConcern(journalAck)
+	} else {
+		w = buildNumericWriteConcern(syslog, cfg.WriteConcern, journalAck, cfg.Name)
+	}
+
+	return optionsClient.SetWriteConcern(w)
+}
+
+func parseJournalAck(syslog zerolog.Logger, journalAckStr, name string) *bool {
+	if journalAckStr == "" {
+		return nil
+	}
+
+	b, err := strconv.ParseBool(journalAckStr)
+	if err != nil {
+		syslog.Fatal().Err(err).Msg("failed to parse journal ack from string to bool")
+	}
+	return &b
+}
+
+func buildMajorityWriteConcern(journalAck *bool) *writeconcern.WriteConcern {
+	if journalAck != nil {
+		return &writeconcern.WriteConcern{
+			W:       "majority",
+			Journal: journalAck,
+		}
+	}
+	return writeconcern.Majority()
+}
+
+func buildNumericWriteConcern(syslog zerolog.Logger, writeConcernStr string, journalAck *bool, name string) *writeconcern.WriteConcern {
+	i, err := strconv.Atoi(writeConcernStr)
+	if err != nil {
+		syslog.Fatal().Err(err).Msg("failed to parse write concern from string to int")
+	}
+
+	if journalAck != nil {
+		return &writeconcern.WriteConcern{
+			W:       i,
+			Journal: journalAck,
+		}
+	}
+	return &writeconcern.WriteConcern{
+		W: i,
+	}
+}
+
+func connectToMongo(ctx context.Context, optionsClient *options.ClientOptions) (*mongo.Client, error) {
+	client, err := mongo.Connect(ctx, optionsClient)
+	if err != nil {
+		return nil, err
+	}
+
+	// ping mongo
+	err = client.Ping(ctx, readpref.Primary())
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+func (m *Mongo) Close(ctx context.Context) {
+	m.syslog.Info().Msg("disconnecting mongo connection...")
+	if err := m.Client.Disconnect(ctx); err != nil {
+		m.syslog.Error().Err(err).Msg("failed disconnecting mongo connection")
+	}
+	m.syslog.Info().Msg("mongo connection disconnected")
+}

@@ -1,0 +1,268 @@
+package config
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+
+	rbmq "github.com/imbagila/go-amqp-reconnect/rabbitmq"
+	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/rs/zerolog"
+	"github.com/spf13/viper"
+)
+
+const (
+	DefaultPrefetchCount   = 1
+	DefaultConsumerTimeout = 86400000
+
+	// default exchange name for all queues
+	ExchangeName = "backup.housekeep"
+
+	RoutingKeyAll = "#"
+
+	// this routing key used when there's matched job running
+	RoutingKeyJob                   = "job"
+	RoutingKeyObserver              = "observer"
+	RoutingKeyRecordBackup          = "record.backup"
+	RoutingKeyRecordHousekeep       = "record.housekeep"
+	RoutingKeyRecordBackupHousekeep = "record.backup-housekeep"
+	RoutingKeyRecordVerify          = "record.verify"
+
+	ConsumerProducer       = "producer"
+	ConsumerWorker         = "worker"
+	ConsumerProducerWorker = "producer.worker"
+	ConsumerObserver       = "observer"
+	ConsumerVerify         = "verify"
+)
+
+type RabbitmqConfig struct {
+	Name            string `validate:"required"`
+	Url             string `validate:"required"`
+	PrefetchCount   int
+	ConsumerTimeout int64
+}
+
+func NewRabbitmqConfig(name, key string) RabbitmqConfig {
+	return RabbitmqConfig{
+		Name:            name,
+		Url:             viper.GetString("RABBITMQ_" + key + "_URL"),
+		PrefetchCount:   viper.GetInt("RABBITMQ_" + key + "_PREFETCH_COUNT"),
+		ConsumerTimeout: viper.GetInt64("RABBITMQ_" + key + "_CONSUMER_TIMEOUT"),
+	}
+}
+
+type Rabbitmq struct {
+	Config     RabbitmqConfig
+	Connection *rbmq.Connection
+	Channel    *rbmq.Channel
+	syslog     zerolog.Logger
+}
+
+func NewRabbitMQ(ctx context.Context, syslog zerolog.Logger, timeout time.Duration, cfg RabbitmqConfig) *Rabbitmq {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	syslog.Info().Msg("connecting to rabbitmq...")
+
+	if cfg.PrefetchCount == 0 {
+		cfg.PrefetchCount = DefaultPrefetchCount
+	}
+
+	if cfg.ConsumerTimeout == 0 {
+		cfg.ConsumerTimeout = DefaultConsumerTimeout
+	}
+
+	r := &Rabbitmq{Config: cfg, syslog: syslog}
+
+	// failed to connect to rabbitmq
+	connection, err := rbmq.Dial(cfg.Url)
+	if err != nil {
+		syslog.Fatal().Err(err).Msg("failed to connect to rabbitmq")
+	}
+	r.Connection = connection
+
+	// open channel
+	channel, err := connection.Channel()
+	if err != nil {
+		syslog.Fatal().Err(err).Msg("failed to open channel")
+	}
+	r.Channel = channel
+
+	// create exchanges
+	if err := channel.ExchangeDeclare(
+		ExchangeName,       // exchange name
+		amqp.ExchangeTopic, // exchange kind
+		true,               // durable
+		false,              // auto delete
+		false,              // internal
+		false,              // no wait
+		nil,                // args
+	); err != nil {
+		syslog.Fatal().Err(err).Msg("failed to declare an exchange")
+	}
+
+	// setup queues
+	r.SetupQueue(RoutingKeyJob, ConsumerProducerWorker)
+	// r.SetupQueue(RoutingKeyJob, ConsumerVerify)
+	r.SetupQueue(RoutingKeyObserver, ConsumerObserver)
+	r.SetupQueue(RoutingKeyRecordBackup, ConsumerWorker)
+	r.SetupQueue(RoutingKeyRecordHousekeep, ConsumerWorker)
+	r.SetupQueue(RoutingKeyRecordBackupHousekeep, ConsumerWorker)
+	r.SetupQueue(RoutingKeyRecordVerify, ConsumerWorker)
+
+	syslog.Info().Msg("connected to rabbitmq")
+	return r
+}
+
+func (r *Rabbitmq) SetupQueue(routingKey, consumerName string) {
+	queueName := ExchangeName + "." + routingKey + "." + consumerName
+
+	// create queue
+	if _, err := r.Channel.QueueDeclare(
+		queueName, // name
+		true,      // durable
+		false,     // auto delete
+		false,     // exclusive
+		false,     // no wait
+		amqp.Table{
+			amqp.ConsumerTimeoutArg: r.Config.ConsumerTimeout,
+		}, // args
+	); err != nil {
+		r.syslog.Fatal().Err(err).Msg("failed to declare a queue")
+	}
+
+	// bind exchange to queue
+	if err := r.Channel.QueueBind(
+		queueName,    // name
+		routingKey,   // key
+		ExchangeName, // exchange
+		false,        // no wait
+		nil,          // args
+	); err != nil {
+		r.syslog.Fatal().Err(err).Msg("failed to bind exchange to queue")
+	}
+
+	// set prefetch count (per-consumer)
+	if err := r.Channel.Qos(r.Config.PrefetchCount, 0, false); err != nil {
+		r.syslog.Fatal().Err(err).Msg("failed to set prefetch count")
+	}
+}
+
+func (r *Rabbitmq) StartConsume(routingKey, consumerName string) <-chan amqp.Delivery {
+	queueName := ExchangeName + "." + routingKey + "." + consumerName
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "N/A"
+	}
+	consumerTag := fmt.Sprintf("%s-%s-%s", consumerName, hostname, strconv.Itoa(os.Getpid()))
+
+	delivery, err := r.Channel.Consume(
+		queueName,   // queue
+		consumerTag, // consumer
+		false,       // auto ack
+		false,       // exclusive
+		false,       // no local
+		false,       // no wait
+		nil,         // args
+	)
+	if err != nil {
+		r.syslog.Fatal().Err(err).Msg("failed to register a consumer")
+	}
+
+	return delivery
+}
+
+// StartConsumeFromQueue consumes from a specific queue with custom exchange name
+// Queue name format: {exchangeName}.{routingKey}
+func (r *Rabbitmq) StartConsumeFromQueue(exchangeName, routingKey, consumerName string) <-chan amqp.Delivery {
+	queueName := exchangeName + "." + routingKey
+
+	// Declare the exchange if it doesn't exist
+	if err := r.Channel.ExchangeDeclare(
+		exchangeName,       // exchange name
+		amqp.ExchangeTopic, // exchange kind
+		true,               // durable
+		false,              // auto delete
+		false,              // internal
+		false,              // no wait
+		nil,                // args
+	); err != nil {
+		r.syslog.Fatal().Err(err).Msg("failed to declare exchange")
+	}
+
+	// Declare the queue
+	if _, err := r.Channel.QueueDeclare(
+		queueName, // name
+		true,      // durable
+		false,     // auto delete
+		false,     // exclusive
+		false,     // no wait
+		amqp.Table{
+			amqp.ConsumerTimeoutArg: r.Config.ConsumerTimeout,
+		}, // args
+	); err != nil {
+		r.syslog.Fatal().Err(err).Msg("failed to declare queue")
+	}
+
+	// Bind queue to exchange
+	if err := r.Channel.QueueBind(
+		queueName,    // queue name
+		routingKey,   // routing key
+		exchangeName, // exchange
+		false,        // no wait
+		nil,          // args
+	); err != nil {
+		r.syslog.Fatal().Err(err).Msg("failed to bind queue to exchange")
+	}
+
+	// Set prefetch count
+	if err := r.Channel.Qos(r.Config.PrefetchCount, 0, false); err != nil {
+		r.syslog.Fatal().Err(err).Msg("failed to set prefetch count")
+	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		hostname = "N/A"
+	}
+	consumerTag := fmt.Sprintf("%s-%s-%s", consumerName, hostname, strconv.Itoa(os.Getpid()))
+
+	delivery, err := r.Channel.Consume(
+		queueName,   // queue
+		consumerTag, // consumer
+		false,       // auto ack
+		false,       // exclusive
+		false,       // no local
+		false,       // no wait
+		nil,         // args
+	)
+	if err != nil {
+		r.syslog.Fatal().Err(err).Msg("failed to register a consumer")
+	}
+
+	r.syslog.Info().
+		Str("exchange", exchangeName).
+		Str("queue", queueName).
+		Str("routing_key", routingKey).
+		Msg("started consuming from queue")
+
+	return delivery
+}
+
+func (r *Rabbitmq) Close() {
+	// closing rabbitmq channel
+	r.syslog.Info().Msg("closing rabbitmq channel...")
+	if err := r.Channel.Close(); err != nil {
+		r.syslog.Error().Err(err).Msg("failed to close rabbitmq channel")
+	}
+	r.syslog.Info().Msg("rabbitmq channel closed")
+
+	// closing rabbitmq connection
+	r.syslog.Info().Msg("closing rabbitmq connection...")
+	if err := r.Connection.Close(); err != nil {
+		r.syslog.Error().Err(err).Msg("failed to close rabbitmq connection")
+	}
+	r.syslog.Info().Msg("rabbitmq connection closed")
+}

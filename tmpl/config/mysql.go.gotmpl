@@ -1,0 +1,118 @@
+package config
+
+import (
+	"context"
+	"database/sql"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/rs/zerolog"
+	"github.com/spf13/viper"
+	{{if .IsOtelEnabled }}"github.com/XSAM/otelsql"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"{{end}}
+)
+
+const (
+	DefaultMysqlConnMaxIdleTimeMin = 15 * time.Minute
+	DefaultMysqlConnMaxLifetimeMin = 15 * time.Minute
+	DefaultMysqlMaxOpenConns       = 10
+	DefaultMysqlMaxIdleConns       = 10
+)
+
+type MysqlConfig struct {
+	Name            string        `validate:"required"`
+	Dsn             string        `validate:"required"`
+	connMaxIdleTime time.Duration `validate:"numeric,gte=0"`
+	connMaxLifetime time.Duration `validate:"numeric,gte=0"`
+	maxOpenConns    int           `validate:"numeric,gte=0"`
+	maxIdleConns    int           `validate:"numeric,gte=0"`
+}
+
+func NewMysqlConfig(name string, key string) MysqlConfig {
+	return MysqlConfig{
+		Name:            name,
+		Dsn:             viper.GetString("MYSQL_" + key + "_DSN"),
+		connMaxIdleTime: viper.GetDuration("MYSQL_"+key+"_CONN_MAX_IDLE_TIME_MIN") * time.Minute,
+		connMaxLifetime: viper.GetDuration("MYSQL_"+key+"_CONN_MAX_LIFETIME_MIN") * time.Minute,
+		maxOpenConns:    viper.GetInt("MYSQL_" + key + "_MAX_OPEN_CONNS"),
+		maxIdleConns:    viper.GetInt("MYSQL_" + key + "_MAX_IDLE_CONNS"),
+	}
+}
+
+type Mysql struct {
+	Db     *sql.DB
+	syslog zerolog.Logger
+	name   string
+}
+
+func NewMysql(ctx context.Context, syslog zerolog.Logger, timeout time.Duration, cfg MysqlConfig) *Mysql {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	zlog := syslog.With().Str("name", cfg.Name).Logger()
+	zlog.Info().Msg("connecting to mysql...")
+
+	if cfg.connMaxIdleTime == 0 {
+		cfg.connMaxIdleTime = DefaultMysqlConnMaxIdleTimeMin
+	}
+
+	if cfg.connMaxLifetime == 0 {
+		cfg.connMaxLifetime = DefaultMysqlConnMaxLifetimeMin
+	}
+
+	if cfg.maxOpenConns == 0 {
+		cfg.maxOpenConns = DefaultMysqlMaxOpenConns
+	}
+
+	if cfg.maxIdleConns == 0 {
+		cfg.maxIdleConns = DefaultMysqlMaxIdleConns
+	}
+
+	m := &Mysql{}
+	m.name = cfg.Name
+	m.syslog = zlog
+
+	// connecting to mysql with OpenTelemetry instrumentation
+	{{if .IsOtelEnabled}}
+	db, err := otelsql.Open("mysql", cfg.Dsn, otelsql.WithAttributes(
+		semconv.DBSystemNameMySQL,
+	))
+	{{else}}
+	db, err := sql.Open("sqlite3", cfg.Dsn)
+	{{end}}
+	if err != nil {
+		zlog.Fatal().Err(err).Msg("failed to connect mysql")
+	}
+
+	{{if .IsOtelEnabled}}
+	// Register OpenTelemetry instrumentation
+	if _, err := otelsql.RegisterDBStatsMetrics(db, otelsql.WithAttributes(
+		semconv.DBSystemNameMySQL,
+	)); err != nil {
+		zlog.Fatal().Err(err).Msg("failed to register mysql stats metrics")
+	}
+	{{end}}
+
+	// set variable
+	db.SetConnMaxIdleTime(cfg.connMaxIdleTime)
+	db.SetConnMaxLifetime(cfg.connMaxLifetime)
+	db.SetMaxOpenConns(cfg.maxOpenConns)
+	db.SetMaxIdleConns(cfg.maxIdleConns)
+
+	// ping mysql
+	if err := db.PingContext(ctx); err != nil {
+		zlog.Fatal().Err(err).Msg("failed to ping mysql")
+	}
+
+	m.Db = db
+	zlog.Info().Msg("connected to mysql")
+	return m
+}
+
+func (m *Mysql) Close() {
+	m.syslog.Info().Msg("closing database mysql...")
+	if err := m.Db.Close(); err != nil {
+		m.syslog.Error().Err(err).Msg("failed to close mysql connection")
+	}
+	m.syslog.Info().Msg("database mysql closed")
+}

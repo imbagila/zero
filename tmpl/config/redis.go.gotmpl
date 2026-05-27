@@ -1,0 +1,124 @@
+package config
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/go-redsync/redsync/v4"
+	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
+	{{if .IsOtelEnabled }}"github.com/redis/go-redis/extra/redisotel/v9"{{end}}
+	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
+	"github.com/rs/zerolog"
+	"github.com/spf13/viper"
+)
+
+const (
+	DefaultTtl = 900
+)
+
+type RedisConfig struct {
+	Name      string `validate:"required"`
+	IsEnabled bool
+	Addr      string `validate:"required"`
+	Username  string
+	Password  string
+	Ttl       time.Duration
+}
+
+func NewRedisConfig(name, key string) RedisConfig {
+	return RedisConfig{
+		Name:      name,
+		IsEnabled: viper.GetBool("REDIS_" + key + "_ENABLED"),
+		Addr:      viper.GetString("REDIS_" + key + "_ADDR"),
+		Username:  viper.GetString("REDIS_" + key + "_USERNAME"),
+		Password:  viper.GetString("REDIS_" + key + "_PASSWORD"),
+	}
+}
+
+type Redis struct {
+	name      string
+	syslog    zerolog.Logger
+	Ttl       time.Duration
+	Client    *redis.Client
+	Redsync   *redsync.Redsync
+	IsEnabled bool
+}
+
+func NewRedis(ctx context.Context, syslog zerolog.Logger, timeout time.Duration, cfg RedisConfig) *Redis {
+	if !cfg.IsEnabled {
+		return &Redis{}
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	zlog := syslog.With().Str("name", cfg.Name).Logger()
+	zlog.Info().Msg("connecting to redis...")
+	r := &Redis{
+		name:   cfg.Name,
+		syslog: zlog,
+	}
+
+	r.Ttl = cfg.Ttl
+	if cfg.Ttl == 0 {
+		r.Ttl = DefaultTtl * time.Second
+	}
+	r.IsEnabled = cfg.IsEnabled
+
+	// connect to redis
+	client := redis.NewClient(&redis.Options{
+		Addr:     cfg.Addr,
+		Username: cfg.Username,
+		Password: cfg.Password,
+		DB:       0,
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: maintnotifications.ModeDisabled,
+		},
+	})
+	pool := goredis.NewPool(client)
+
+	// Create an instance of redisync to be used to obtain a mutual exclusion
+	// lock for distributed operations across multiple workers
+	rs := redsync.New(pool)
+
+	{{if .IsOtelEnabled}}
+	// Enable tracing instrumentation.
+	if err := redisotel.InstrumentTracing(client); err != nil {
+		zlog.Fatal().Err(err).Msg("failed to instrument tracing redis")
+	}
+
+	// Enable metrics instrumentation.
+	if err := redisotel.InstrumentMetrics(client); err != nil {
+		zlog.Fatal().Err(err).Msg("failed to instrument metrics redis")
+	}
+	{{end}}
+
+	// ping to redis
+	cmd := client.Ping(ctx)
+	if cmd == nil {
+		err := errors.New("*redis.StatusCmd is empty")
+		zlog.Fatal().Err(err).Msg("failed to ping redis")
+	}
+
+	if cmd != nil && cmd.Err() != nil {
+		zlog.Fatal().Err(cmd.Err()).Msg("failed to ping redis")
+	}
+	r.Client = client
+	r.Redsync = rs
+
+	zlog.Info().Msg("connected to redis")
+	return r
+}
+
+func (r *Redis) Close() {
+	if r.Client == nil {
+		return
+	}
+	r.syslog.Info().Msg("closing redis connection...")
+	if err := r.Client.Close(); err != nil {
+		r.syslog.Error().Err(err).Msg("failed to close redis connection")
+	}
+	r.syslog.Info().Msg("redis connection closed")
+}

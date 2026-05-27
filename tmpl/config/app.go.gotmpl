@@ -1,0 +1,25 @@
+package config
+
+import (
+	"time"
+
+	"github.com/go-playground/validator/v10"
+)
+
+const (
+	DefaultTimeout         = 5 * time.Second
+	DefaultShutdownTimeout = 30 * time.Second
+	DefaultLogLevel        = "info"
+)
+
+type Config struct {
+	validate *validator.Validate
+
+	Timeout         time.Duration `validate:"numeric,gte=0"`
+	ShutdownTimeout time.Duration `validate:"numeric,gte=0"`
+	LogLevel        string        `validate:"oneof=trace debug info warn error"`
+	{{if .IsOtelEnabled}}Observability ObservabilityConfig{{end}}
+}
+
+func New() {
+}

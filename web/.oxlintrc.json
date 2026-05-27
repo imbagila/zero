@@ -1,0 +1,55 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "react-perf", "typescript", "import", "unicorn", "oxc"],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "pedantic": "off"
+  },
+  "rules": {
+    "eslint/no-unused-vars": "error",
+    "no-alert": "error",
+    "oxc/approx-constant": "warn",
+    "no-plusplus": ["error", { "allowForLoopAfterthoughts": true }],
+    "import/no-cycle": ["error", { "maxDepth": 3 }],
+    "import/no-unassigned-import": ["warn", { "allow": ["**/*.css"] }],
+    "typescript/no-floating-promises": ["error", { "ignoreVoid": true }],
+    "typescript/no-unsafe-assignment": "warn",
+    "react/jsx-key": "error",
+    "react/jsx-no-target-blank": "error",
+    "react/no-children-prop": "error",
+    "react/no-danger-with-children": "error",
+    "react/no-deprecated": "warn",
+    "react-perf/jsx-no-new-object-as-prop": "warn",
+    "react-perf/jsx-no-new-array-as-prop": "warn"
+  },
+  "settings": {
+    "jsx-a11y": {
+      "polymorphicPropName": null,
+      "components": {},
+      "attributes": {}
+    },
+    "react": {
+      "formComponents": [],
+      "linkComponents": [],
+      "version": "19.2.0",
+      "componentWrapperFunctions": []
+    },
+    "jsdoc": {
+      "ignorePrivate": false,
+      "ignoreInternal": false,
+      "ignoreReplacesDocs": true,
+      "overrideReplacesDocs": true,
+      "augmentsExtendsReplacesDocs": false,
+      "implementsReplacesDocs": false,
+      "exemptDestructuredRootsFromChecks": false,
+      "tagNamePreference": {}
+    }
+  },
+  "env": {
+    "builtin": true,
+    "browser": true
+  },
+  "globals": {},
+  "ignorePatterns": ["dist/**"]
+}

@@ -1,0 +1,25 @@
+{
+    "typescript.experimental.useTsgo": true,
+    "editor.codeActionsOnSave": {
+    "source.fixAll.oxc": "always"
+    },
+    "oxc.path.node": "node",
+    "oxc.tsConfigPath": "web/tsconfig.json",
+    "oxc.path.tsgolint": "web/node_modules/.bin/tsgolint",
+    "oxc.path.oxfmt": "web/node_modules/.bin/oxfmt",
+    "oxc.path.oxlint": "web/node_modules/.bin/oxlint",
+    "oxc.typeAware": true,
+    "oxc.fmt.configPath": "web/.oxfmtrc.json",
+    "[javascript]": {
+        "editor.defaultFormatter": "oxc.oxc-vscode",
+        "editor.formatOnSave": true
+    },
+    "[typescript]": {
+        "editor.defaultFormatter": "oxc.oxc-vscode",
+        "editor.formatOnSave": true
+    },
+    "[typescriptreact]": {
+        "editor.defaultFormatter": "oxc.oxc-vscode",
+        "editor.formatOnSave": true
+    }
+}

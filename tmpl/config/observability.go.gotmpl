@@ -1,0 +1,232 @@
+package config
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/grafana/pyroscope-go"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/rs/zerolog"
+	"github.com/spf13/viper"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.37.0"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+)
+
+var Tracer trace.Tracer
+
+const (
+	DefaultServiceName      = "backup-housekeep"
+	DefaultServiceVersion   = "1.3.0"
+	DefaultTracerEndpoint   = "tempo.local:4317"
+	DefaultMetricsPort      = "9464"
+	DefaultProfilerEndpoint = "http://pyroscope.local:4040"
+)
+
+type ObservabilityConfig struct {
+	ServiceName            string
+	ServiceVersion         string
+	OtelResourceAttributes string
+
+	IsEnabled         bool `validate:"boolean"`
+	OtlpTimeout       time.Duration
+	OtlpProtocol      string `validate:"required_if=IsEnabled true"`
+	OtlpEndpoint      string `validate:"required_if=IsEnabled true"`
+	PyroscopeEndpoint string `validate:"required_if=IsEnabled true"`
+	MetricsPort       string `validate:"required_if=IsEnabled true"`
+}
+
+func NewObservabilityConfig(serviceName, serviceVersion string) ObservabilityConfig {
+	if serviceName == "" {
+		serviceName = DefaultServiceName
+	}
+	if serviceVersion == "" {
+		serviceVersion = DefaultServiceVersion
+	}
+
+	return ObservabilityConfig{
+		ServiceName:       serviceName,
+		ServiceVersion:    serviceVersion,
+		IsEnabled:         viper.GetBool("IS_OBSERVABILITY_ENABLED"),
+		OtlpTimeout:       viper.GetDuration("OTEL_EXPORTER_OTLP_TIMEOUT"),
+		OtlpProtocol:      viper.GetString("OTEL_EXPORTER_OTLP_PROTOCOL"),
+		OtlpEndpoint:      viper.GetString("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		PyroscopeEndpoint: viper.GetString("PYROSCOPE_ENDPOINT"),
+		MetricsPort:       viper.GetString("OTEL_METRICS_PORT"),
+	}
+}
+
+type Observability struct {
+	Shutdown func(context.Context) error
+}
+
+func NewObservability(ctx context.Context, syslog zerolog.Logger, cfg ObservabilityConfig) *Observability {
+	if !cfg.IsEnabled {
+		// Initialize a no-op tracer when observability is disabled
+		Tracer = noop.NewTracerProvider().Tracer(cfg.ServiceName)
+		return nil
+	}
+
+	os.Setenv("OTEL_RESOURCE_ATTRIBUTES", fmt.Sprintf("service.name=%s,service.version=%s", cfg.ServiceName, cfg.ServiceVersion))
+	os.Setenv("OTEL_SERVICE_NAME", cfg.ServiceName)
+	os.Setenv("OTEL_SERVICE_VERSION", cfg.ServiceVersion)
+
+	zlog := syslog.With().
+		Str("service_name", cfg.ServiceName).
+		Str("service_version", cfg.ServiceVersion).
+		Logger()
+	zlog.Info().Msg("initializing observability")
+
+	var shutdownFuncs []func(context.Context) error
+	var err error
+
+	shutdown := func(ctx context.Context) error {
+		zlog.Info().Msg("shutting down observability")
+		var err error
+		for _, fn := range shutdownFuncs {
+			err = errors.Join(err, fn(ctx))
+		}
+		shutdownFuncs = nil
+		zlog.Info().Msg("observability shut down successfully")
+		return err
+	}
+	observability := &Observability{
+		Shutdown: shutdown,
+	}
+
+	handleErr := func(inErr error) {
+		err = errors.Join(inErr, shutdown(ctx))
+	}
+
+	prop := newPropagator()
+	otel.SetTextMapPropagator(prop)
+
+	res, err := newResource(cfg.ServiceName, cfg.ServiceVersion)
+	if err != nil {
+		handleErr(err)
+		zlog.Fatal().Err(err).Msg("failed to create resource")
+	}
+
+	tracerProvider, err := newTracerProvider(ctx, res, cfg.OtlpEndpoint)
+	if err != nil {
+		handleErr(err)
+		zlog.Fatal().Err(err).Msg("failed to create tracer provider")
+	}
+	shutdownFuncs = append(shutdownFuncs, tracerProvider.Shutdown)
+	otel.SetTracerProvider(tracerProvider)
+	Tracer = otel.Tracer(cfg.ServiceName)
+
+	meterProvider, err := newMeterProvider(res, zlog, cfg.MetricsPort)
+	if err != nil {
+		handleErr(err)
+		zlog.Fatal().Err(err).Msg("failed to create meter provider")
+	}
+	shutdownFuncs = append(shutdownFuncs, meterProvider.Shutdown)
+	otel.SetMeterProvider(meterProvider)
+
+	profilerProvider, err := newProfilerProvider(cfg.ServiceName, cfg.PyroscopeEndpoint)
+	if err != nil {
+		handleErr(err)
+		zlog.Fatal().Err(err).Msg("failed to create profiler provider")
+	}
+	shutdownFuncs = append(shutdownFuncs, func(ctx context.Context) error {
+		return profilerProvider.Stop()
+	})
+
+	zlog.Info().Msg("observability initialized successfully")
+	return observability
+}
+
+func newResource(serviceName, serviceVersion string) (*resource.Resource, error) {
+	return resource.Merge(
+		resource.Default(),
+		resource.NewWithAttributes(
+			semconv.SchemaURL,
+			semconv.ServiceNameKey.String(serviceName),
+			semconv.ServiceVersionKey.String(serviceVersion),
+		),
+	)
+}
+
+func newPropagator() propagation.TextMapPropagator {
+	return propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	)
+}
+
+func newTracerProvider(ctx context.Context, res *resource.Resource, endpoint string) (*sdktrace.TracerProvider, error) {
+	exporter, err := otlptrace.New(
+		ctx,
+		otlptracegrpc.NewClient(
+			otlptracegrpc.WithEndpoint(endpoint),
+			otlptracegrpc.WithInsecure(),
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create trace exporter for endpoint %s: %w", endpoint, err)
+	}
+
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter,
+			sdktrace.WithBatchTimeout(5*time.Second),
+			sdktrace.WithMaxExportBatchSize(512),
+			sdktrace.WithExportTimeout(30*time.Second),
+		),
+		sdktrace.WithResource(res),
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+	)
+	return provider, nil
+}
+
+func newMeterProvider(res *resource.Resource, syslog zerolog.Logger, port string) (*metric.MeterProvider, error) {
+	exporter, err := prometheus.New()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create prometheus exporter: %w", err)
+	}
+
+	provider := metric.NewMeterProvider(
+		metric.WithResource(res),
+		metric.WithReader(exporter),
+	)
+
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.Handler())
+
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
+
+	go func() {
+		syslog.Info().Str("port", port).Msg("Starting Prometheus metrics server")
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			syslog.Error().Err(err).Msg("Metrics server failed")
+		}
+	}()
+
+	return provider, nil
+}
+
+func newProfilerProvider(applicationName, serverAddress string) (*pyroscope.Profiler, error) {
+	p, err := pyroscope.Start(pyroscope.Config{
+		ApplicationName: applicationName,
+		ServerAddress:   serverAddress,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pyroscope profiler: %w", err)
+	}
+	return p, nil
+}
